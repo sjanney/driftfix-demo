@@ -1,16 +1,27 @@
-"""Customer-support bot built on the OpenAI Assistants API."""
+"""Customer-support bot built on the OpenAI Responses API."""
 
 import json
 import os
-import time
 
 from openai import OpenAI
 
 from .orders import get_order_status
 
-ASSISTANT_ID = os.environ.get("SUPPORT_ASSISTANT_ID", "asst_support")
+# The Assistant's instruction + tool bundle previously lived server-side as an
+# Assistant object. Create a matching Prompt in the dashboard and store its ID
+# here. (Reusable prompt objects are deprecated Nov 30, 2026 — eventually inline
+# the prompt content in this file instead.)
+PROMPT_ID = os.environ.get("SUPPORT_PROMPT_ID", "pmpt_support")
 
-TOOLS = {"get_order_status": get_order_status}
+# Tool schemas previously defined on the Assistant object server-side.
+# Configure via SUPPORT_TOOLS JSON env var, e.g.:
+#   [{"type":"function","name":"get_order_status",
+#     "description":"Get the status of an order.",
+#     "parameters":{"type":"object","properties":{
+#       "order_id":{"type":"string","description":"Order ID"}}
+#      "required":["order_id"],"additionalProperties":false}}]
+TOOL_SCHEMAS = json.loads(os.environ.get("SUPPORT_TOOLS", "[]"))
+TOOL_FUNCTIONS = {"get_order_status": get_order_status}
 
 
 def make_client():
@@ -18,35 +29,45 @@ def make_client():
 
 
 def start_conversation(client):
-    """Create a thread for a new support conversation and return its id."""
-    return client.beta.threads.create(metadata={"source": "support-bot"}).id
+    """Create a conversation for a new support session and return its id."""
+    return client.conversations.create(metadata={"source": "support-bot"}).id
 
 
-def _run_tools(client, thread_id, run):
-    outputs = []
-    for call in run.required_action.submit_tool_outputs.tool_calls:
-        fn = TOOLS[call.function.name]
-        args = json.loads(call.function.arguments or "{}")
-        outputs.append({"tool_call_id": call.id, "output": json.dumps(fn(**args))})
-    return client.beta.threads.runs.submit_tool_outputs(
-        thread_id=thread_id, run_id=run.id, tool_outputs=outputs
-    )
+def _execute_tool(call):
+    fn = TOOL_FUNCTIONS[call.name]
+    args = json.loads(call.arguments or "{}")
+    return json.dumps(fn(**args))
 
 
-def reply(client, thread_id, text, poll_seconds=0.5):
+def reply(client, conversation_id, text, poll_seconds=0.5):
     """Send the customer's message and return the assistant's answer."""
-    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=text)
-    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
+    input_items = [{"role": "user", "content": text}]
 
-    while run.status in ("queued", "in_progress", "requires_action"):
-        if run.status == "requires_action":
-            run = _run_tools(client, thread_id, run)
-            continue
-        time.sleep(poll_seconds)
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+    while True:
+        try:
+            response = client.responses.create(
+                model=os.environ.get("SUPPORT_MODEL", "gpt-6-astra"),
+                prompt={"id": PROMPT_ID},
+                tools=TOOL_SCHEMAS,
+                input=input_items,
+                conversation=conversation_id,
+            )
+        except Exception as e:
+            raise RuntimeError(f"assistant response failed: {e}") from e
 
-    if run.status != "completed":
-        raise RuntimeError(f"assistant run ended with status {run.status}")
+        if response.error:
+            raise RuntimeError(f"assistant response failed: {response.error}")
 
-    messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1)
-    return messages.data[0].content[0].text.value
+        tool_calls = [item for item in response.output if item.type == "function_call"]
+        if not tool_calls:
+            return response.output_text
+
+        input_items += response.output
+        for call in tool_calls:
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": _execute_tool(call),
+                }
+            )
