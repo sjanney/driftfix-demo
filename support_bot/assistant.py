@@ -1,14 +1,19 @@
-"""Customer-support bot built on the OpenAI Assistants API."""
+"""Customer-support bot built on the OpenAI Responses API."""
 
+import inspect
 import json
 import os
-import time
 
 from openai import OpenAI
 
 from .orders import get_order_status
 
-ASSISTANT_ID = os.environ.get("SUPPORT_ASSISTANT_ID", "asst_support")
+# The Assistants API bundled the model, instructions, and tool definitions into
+# a server-side assistant object. The Responses API needs those on each request,
+# so they are configured here instead. Set SUPPORT_MODEL (and optionally
+# SUPPORT_INSTRUCTIONS) to match the assistant you are migrating away from.
+MODEL = os.environ.get("SUPPORT_MODEL", "gpt-6-astra")
+INSTRUCTIONS = os.environ.get("SUPPORT_INSTRUCTIONS")
 
 TOOLS = {"get_order_status": get_order_status}
 
@@ -17,36 +22,87 @@ def make_client():
     return OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
+def _build_tool_definitions():
+    """Derive JSON-schema tool definitions from the callables in TOOLS.
+
+    The Assistants API stored these schemas on the assistant object; the
+    Responses API receives them on every request. Deriving the parameter names
+    from the real function signatures avoids guessing what the assistant had.
+    """
+    definitions = []
+    for name, fn in TOOLS.items():
+        properties = {}
+        required = []
+        for param_name, param in inspect.signature(fn).parameters.items():
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            if param.default is inspect.Parameter.empty:
+                required.append(param_name)
+            properties[param_name] = {"type": "string"}
+        definitions.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": (fn.__doc__ or "").strip() or f"Call the {name} function.",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            }
+        )
+    return definitions
+
+
+TOOL_DEFINITIONS = _build_tool_definitions()
+
+
 def start_conversation(client):
-    """Create a thread for a new support conversation and return its id."""
-    return client.beta.threads.create(metadata={"source": "support-bot"}).id
+    """Create a conversation for a new support session and return its id."""
+    return client.conversations.create(metadata={"source": "support-bot"}).id
 
 
-def _run_tools(client, thread_id, run):
+def _tool_outputs(response):
+    """Execute every function call in a response and format the results."""
     outputs = []
-    for call in run.required_action.submit_tool_outputs.tool_calls:
-        fn = TOOLS[call.function.name]
-        args = json.loads(call.function.arguments or "{}")
-        outputs.append({"tool_call_id": call.id, "output": json.dumps(fn(**args))})
-    return client.beta.threads.runs.submit_tool_outputs(
-        thread_id=thread_id, run_id=run.id, tool_outputs=outputs
-    )
-
-
-def reply(client, thread_id, text, poll_seconds=0.5):
-    """Send the customer's message and return the assistant's answer."""
-    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=text)
-    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=ASSISTANT_ID)
-
-    while run.status in ("queued", "in_progress", "requires_action"):
-        if run.status == "requires_action":
-            run = _run_tools(client, thread_id, run)
+    for item in response.output:
+        if item.type != "function_call":
             continue
-        time.sleep(poll_seconds)
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        fn = TOOLS[item.name]
+        args = json.loads(item.arguments or "{}")
+        outputs.append(
+            {
+                "type": "function_call_output",
+                "call_id": item.call_id,
+                "output": json.dumps(fn(**args)),
+            }
+        )
+    return outputs
 
-    if run.status != "completed":
-        raise RuntimeError(f"assistant run ended with status {run.status}")
 
-    messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1)
-    return messages.data[0].content[0].text.value
+def _create_response(client, conversation_id, input_items):
+    kwargs = {
+        "model": MODEL,
+        "input": input_items,
+        "conversation": conversation_id,
+        "tools": TOOL_DEFINITIONS,
+    }
+    if INSTRUCTIONS:
+        kwargs["instructions"] = INSTRUCTIONS
+    return client.responses.create(**kwargs)
+
+
+def reply(client, conversation_id, text, poll_seconds=0.5):
+    """Send the customer's message and return the assistant's answer."""
+    response = _create_response(client, conversation_id, [{"role": "user", "content": text}])
+
+    while True:
+        if response.status == "requires_action":
+            response = _create_response(client, conversation_id, _tool_outputs(response))
+            continue
+        if response.status != "completed":
+            raise RuntimeError(f"assistant response ended with status {response.status}")
+        break
+
+    return response.output_text
