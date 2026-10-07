@@ -1,2 +1,2 @@
-openai==1.40.0
+openai==3.24.0
 pytest>=8
