@@ -7,10 +7,11 @@ import time
 from openai import OpenAI
 
 from .orders import get_order_status
+from .refunds import get_refund_status
 
 ASSISTANT_ID = os.environ.get("SUPPORT_ASSISTANT_ID", "asst_support")
 
-TOOLS = {"get_order_status": get_order_status}
+TOOLS = {"get_order_status": get_order_status, "get_refund_status": get_refund_status}
 
 
 def make_client():
