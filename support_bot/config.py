@@ -17,7 +17,7 @@ DRAFT_MODEL = "gpt-5-mini-2025-08-07"
 
 # Voice support line.
 TRANSCRIBE_MODEL = "whisper-1"
-VOICE_MODEL = "tts-1"
+VOICE_MODEL = "gpt-realtime-2.1-mini"
 
 # Images for return labels and help-center articles.
 IMAGE_MODEL = "gpt-image-1"
